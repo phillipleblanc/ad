@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,13 @@ DATA_DIR = Path(
 # Harnesses we can wake via `herdr agent prompt`.
 PROMPTABLE_AGENTS = frozenset({"claude", "codex", "pi"})
 BUSY_STATUSES = frozenset({"working"})
+
+WAKE_DB_PATH = DATA_DIR / "wake.db"
+WAKE_LAUNCHD_LABEL = "tech.leblanc.ad.wake"
+WAKE_DEFAULT_MESSAGE = "continue"
+WAKE_SUBCOMMANDS = frozenset(
+    {"list", "cancel", "clear", "daemon", "install", "uninstall", "status"}
+)
 
 
 class AdError(Exception):
@@ -457,6 +465,561 @@ def format_human(messages: List[Dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 
+# ---------------------------------------------------------------------------
+# Wake (durable self-timer)
+# ---------------------------------------------------------------------------
+
+
+def parse_duration_ms(raw: str) -> int:
+    compact = raw.strip().lower().replace(" ", "")
+    if not compact:
+        die("duration is required (examples: 30s, 2m, 1h30m)")
+    unit_ms = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
+    pattern = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h|d)")
+    total = 0.0
+    index = 0
+    matched = False
+    for match in pattern.finditer(compact):
+        if match.start() != index:
+            die(f"invalid duration {raw!r} (examples: 30s, 2m, 1h30m)")
+        matched = True
+        amount = float(match.group(1))
+        if amount < 0:
+            die(f"invalid duration amount {match.group(1)!r}")
+        total += amount * unit_ms[match.group(2)]
+        index = match.end()
+    if not matched or index != len(compact):
+        die(f"invalid duration {raw!r} (examples: 30s, 2m, 1h30m)")
+    if total <= 0:
+        die("duration must be greater than zero")
+    return int(total + 0.999999)  # ceil without importing math
+
+
+def format_duration_ms(ms: int) -> str:
+    remaining = max(0, int(ms))
+    if remaining < 1000:
+        return f"{remaining}ms"
+    parts: List[str] = []
+    days, remaining = divmod(remaining, 86_400_000)
+    hours, remaining = divmod(remaining, 3_600_000)
+    minutes, remaining = divmod(remaining, 60_000)
+    seconds = (remaining + 999) // 1000
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds:
+        parts.append(f"{seconds}s")
+    return " ".join(parts) or "0s"
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def wake_db() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(WAKE_DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wakes (
+            id TEXT PRIMARY KEY,
+            target_tab_id TEXT NOT NULL,
+            target_workspace_id TEXT NOT NULL,
+            target_label TEXT NOT NULL,
+            message TEXT NOT NULL,
+            due_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            fired_at INTEGER,
+            error TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wakes_pending_due "
+        "ON wakes(status, due_at)"
+    )
+    conn.commit()
+    return conn
+
+
+def wake_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "target_tab_id": row["target_tab_id"],
+        "target_workspace_id": row["target_workspace_id"],
+        "target_label": row["target_label"],
+        "message": row["message"],
+        "due_at": row["due_at"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "fired_at": row["fired_at"],
+        "error": row["error"],
+    }
+
+
+def resolve_wake_id(conn: sqlite3.Connection, prefix: str) -> str:
+    rows = list(
+        conn.execute(
+            "SELECT id FROM wakes WHERE id = ? OR id LIKE ?",
+            (prefix, f"{prefix}%"),
+        )
+    )
+    if not rows:
+        die(f"no wake job matching {prefix!r}")
+    if len(rows) > 1 and not any(r["id"] == prefix for r in rows):
+        ids = ", ".join(r["id"][:8] for r in rows[:8])
+        die(f"ambiguous wake id prefix {prefix!r}: {ids}")
+    for row in rows:
+        if row["id"] == prefix:
+            return row["id"]
+    return rows[0]["id"]
+
+
+def deliver_to_tab(
+    *,
+    tab_id: str,
+    workspace_id: str,
+    label: str,
+    body: str,
+    from_label: str = "wake",
+) -> Dict[str, Any]:
+    """Write a mailbox message and attempt herdr notify (idle agents only)."""
+    message = {
+        "id": str(uuid.uuid4()),
+        "from": from_label,
+        "from_tab_id": tab_id,
+        "from_workspace_id": workspace_id,
+        "to": label,
+        "to_tab_id": tab_id,
+        "to_workspace_id": workspace_id,
+        "body": body,
+        "sent_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    path = write_message(mailbox_dir(workspace_id, label), message)
+    try:
+        notify_results = notify_recipient(tab_id, from_label, body, force=False)
+    except SystemExit as exc:
+        # herdr helpers call die(); keep the daemon alive and keep the mailbox write.
+        notify_results = [
+            {
+                "ok": False,
+                "reason": "herdr_error",
+                "detail": f"notify aborted (exit {exc.code})",
+            }
+        ]
+    return {"path": str(path), "message": message, "notify": notify_results}
+
+
+def fire_wake_job(conn: sqlite3.Connection, job: Dict[str, Any]) -> None:
+    job_id = job["id"]
+    try:
+        result = deliver_to_tab(
+            tab_id=job["target_tab_id"],
+            workspace_id=job["target_workspace_id"],
+            label=job["target_label"],
+            body=job["message"],
+            from_label="wake",
+        )
+        err_bits = []
+        for item in result.get("notify") or []:
+            if not item.get("ok"):
+                err_bits.append(
+                    str(item.get("detail") or item.get("reason") or "notify failed")
+                )
+        error = "; ".join(err_bits) if err_bits else None
+        conn.execute(
+            "UPDATE wakes SET status = ?, fired_at = ?, error = ? WHERE id = ?",
+            ("fired", now_ms(), error, job_id),
+        )
+        conn.commit()
+        print(
+            f"ad wake: fired {job_id[:8]} -> {job['target_label']} "
+            f"({job['target_tab_id']})",
+            flush=True,
+        )
+    except Exception as exc:
+        conn.execute(
+            "UPDATE wakes SET status = ?, fired_at = ?, error = ? WHERE id = ?",
+            ("fired", now_ms(), str(exc), job_id),
+        )
+        conn.commit()
+        print(f"ad wake: fire failed {job_id[:8]}: {exc}", file=sys.stderr, flush=True)
+
+
+def claim_due_wakes(conn: sqlite3.Connection, limit: int = 20) -> List[Dict[str, Any]]:
+    due = now_ms()
+    rows = list(
+        conn.execute(
+            "SELECT * FROM wakes WHERE status = 'pending' AND due_at <= ? "
+            "ORDER BY due_at ASC LIMIT ?",
+            (due, limit),
+        )
+    )
+    claimed: List[Dict[str, Any]] = []
+    for row in rows:
+        # Optimistic claim so concurrent daemons don't double-fire.
+        cur = conn.execute(
+            "UPDATE wakes SET status = 'firing' WHERE id = ? AND status = 'pending'",
+            (row["id"],),
+        )
+        conn.commit()
+        if cur.rowcount == 1:
+            claimed.append(wake_row_to_dict(row))
+    return claimed
+
+
+def next_pending_due_ms(conn: sqlite3.Connection) -> Optional[int]:
+    row = conn.execute(
+        "SELECT MIN(due_at) AS due_at FROM wakes WHERE status = 'pending'"
+    ).fetchone()
+    if not row or row["due_at"] is None:
+        return None
+    return int(row["due_at"])
+
+
+def ad_executable() -> str:
+    return str(Path(__file__).resolve())
+
+
+def wake_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{WAKE_LAUNCHD_LABEL}.plist"
+
+
+def wake_plist_body() -> str:
+    program = ad_executable()
+    log_dir = DATA_DIR
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stdout = log_dir / "wake-daemon.log"
+    stderr = log_dir / "wake-daemon.err"
+    local_bin = str(Path.home() / ".local" / "bin")
+    path_parts = os.environ.get("PATH", "/usr/bin:/bin").split(":")
+    if local_bin not in path_parts:
+        path_parts.insert(0, local_bin)
+    for extra in ("/usr/local/bin", "/opt/homebrew/bin"):
+        if extra not in path_parts:
+            path_parts.append(extra)
+    path_env = ":".join(path_parts)
+    # Minimal plist; KeepAlive so launchd restarts a crashed daemon.
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{WAKE_LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{program}</string>
+    <string>wake</string>
+    <string>daemon</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>{DATA_DIR}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AD_HOME</key>
+    <string>{DATA_DIR}</string>
+    <key>PATH</key>
+    <string>{path_env}</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>{stdout}</string>
+  <key>StandardErrorPath</key>
+  <string>{stderr}</string>
+</dict>
+</plist>
+"""
+
+
+def launchd_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def launchd_service_target() -> str:
+    return f"{launchd_domain()}/{WAKE_LAUNCHD_LABEL}"
+
+
+def wake_daemon_is_running() -> bool:
+    proc = subprocess.run(
+        ["launchctl", "print", launchd_service_target()],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return False
+    out = proc.stdout
+    # "state = running" is the usual success marker.
+    return "state = running" in out or "pid =" in out
+
+
+def install_wake_launchd() -> None:
+    plist = wake_plist_path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    desired = wake_plist_body()
+    existing = plist.read_text(encoding="utf-8") if plist.exists() else None
+    if existing != desired:
+        plist.write_text(desired, encoding="utf-8")
+
+    domain = launchd_domain()
+    target = launchd_service_target()
+    # bootout is fine if not loaded
+    subprocess.run(
+        ["launchctl", "bootout", target],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    boot = subprocess.run(
+        ["launchctl", "bootstrap", domain, str(plist)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if boot.returncode != 0 and "already bootstrapped" not in (boot.stderr or ""):
+        # Some macOS versions want enable + kickstart after bootstrap failures.
+        err = (boot.stderr or boot.stdout or "").strip()
+        if "Input/output error" not in err and "already" not in err.lower():
+            print(f"ad wake: launchctl bootstrap: {err}", file=sys.stderr)
+
+    subprocess.run(
+        ["launchctl", "enable", target],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    kick = subprocess.run(
+        ["launchctl", "kickstart", "-k", target],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if kick.returncode != 0:
+        err = (kick.stderr or kick.stdout or "").strip()
+        die(f"failed to start wake daemon via launchd: {err or kick.returncode}")
+
+
+def uninstall_wake_launchd() -> None:
+    target = launchd_service_target()
+    subprocess.run(
+        ["launchctl", "bootout", target],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    plist = wake_plist_path()
+    if plist.exists():
+        plist.unlink()
+
+
+def ensure_wake_daemon() -> None:
+    if wake_daemon_is_running():
+        return
+    install_wake_launchd()
+    # Brief wait for launchd to start it.
+    for _ in range(20):
+        if wake_daemon_is_running():
+            return
+        time.sleep(0.1)
+    die("wake daemon did not start; try: ad wake install && ad wake status")
+
+
+def cmd_wake_schedule(duration_raw: str, message_parts: Sequence[str], *, as_json: bool) -> int:
+    label, tab_id, workspace_id = current_identity()
+    body = " ".join(message_parts).strip() or WAKE_DEFAULT_MESSAGE
+    duration_ms = parse_duration_ms(duration_raw)
+    due = now_ms() + duration_ms
+    job_id = str(uuid.uuid4())
+    created = now_ms()
+
+    ensure_wake_daemon()
+    with wake_db() as conn:
+        conn.execute(
+            "INSERT INTO wakes ("
+            "id, target_tab_id, target_workspace_id, target_label, message, "
+            "due_at, status, created_at, fired_at, error"
+            ") VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)",
+            (job_id, tab_id, workspace_id, label, body, due, created),
+        )
+        conn.commit()
+
+    job = {
+        "id": job_id,
+        "target_tab_id": tab_id,
+        "target_workspace_id": workspace_id,
+        "target_label": label,
+        "message": body,
+        "due_at": due,
+        "status": "pending",
+        "created_at": created,
+    }
+    if as_json:
+        print(json.dumps({"ok": True, "job": job}, indent=2))
+    else:
+        when = datetime.fromtimestamp(due / 1000, tz=timezone.utc).astimezone()
+        print(
+            f"wake {job_id[:8]} in {format_duration_ms(duration_ms)} "
+            f"({when.strftime('%Y-%m-%d %H:%M:%S %Z')}) for {label}"
+        )
+        print(f"message: {body}")
+    return 0
+
+
+def cmd_wake_list(as_json: bool) -> int:
+    with wake_db() as conn:
+        rows = [
+            wake_row_to_dict(r)
+            for r in conn.execute(
+                "SELECT * FROM wakes WHERE status IN ('pending', 'firing') "
+                "ORDER BY due_at ASC"
+            )
+        ]
+    if as_json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("(no pending wakes)")
+        return 0
+    now = now_ms()
+    for job in rows:
+        remaining = job["due_at"] - now
+        eta = (
+            f"in {format_duration_ms(remaining)}"
+            if remaining > 0
+            else "due"
+        )
+        print(
+            f"{job['id'][:8]}  {eta:12}  {job['target_label']:20}  {job['message']}"
+        )
+    return 0
+
+
+def cmd_wake_cancel(prefix: str, as_json: bool) -> int:
+    with wake_db() as conn:
+        job_id = resolve_wake_id(conn, prefix)
+        row = conn.execute("SELECT * FROM wakes WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            die(f"no wake job {prefix!r}")
+        if row["status"] not in {"pending", "firing"}:
+            die(f"wake {job_id[:8]} is {row['status']}, not cancellable")
+        conn.execute(
+            "UPDATE wakes SET status = 'cancelled' WHERE id = ?",
+            (job_id,),
+        )
+        conn.commit()
+    if as_json:
+        print(json.dumps({"ok": True, "id": job_id, "status": "cancelled"}, indent=2))
+    else:
+        print(f"cancelled {job_id[:8]}")
+    return 0
+
+
+def cmd_wake_clear(as_json: bool) -> int:
+    with wake_db() as conn:
+        cur = conn.execute(
+            "UPDATE wakes SET status = 'cancelled' "
+            "WHERE status IN ('pending', 'firing')"
+        )
+        conn.commit()
+        n = cur.rowcount
+    if as_json:
+        print(json.dumps({"ok": True, "cancelled": n}, indent=2))
+    else:
+        print(f"cancelled {n} pending wake(s)")
+    return 0
+
+
+def cmd_wake_daemon(_: argparse.Namespace) -> int:
+    """Persistent wake worker; intended to run under launchd."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"ad wake daemon starting (db={WAKE_DB_PATH})", flush=True)
+    while True:
+        try:
+            with wake_db() as conn:
+                for job in claim_due_wakes(conn):
+                    fire_wake_job(conn, job)
+                nxt = next_pending_due_ms(conn)
+        except Exception as exc:
+            print(f"ad wake daemon error: {exc}", file=sys.stderr, flush=True)
+            time.sleep(1.0)
+            continue
+
+        if nxt is None:
+            time.sleep(1.0)
+            continue
+        sleep_s = max(0.05, min(1.0, (nxt - now_ms()) / 1000.0))
+        time.sleep(sleep_s)
+
+
+def cmd_wake(args: argparse.Namespace) -> int:
+    tokens = list(args.wake_args)
+    as_json = bool(args.json)
+    if not tokens:
+        die(
+            "wake usage:\n"
+            "  ad wake <duration> [message...]\n"
+            "  ad wake list\n"
+            "  ad wake cancel <id>\n"
+            "  ad wake clear\n"
+            "  ad wake daemon\n"
+            "  ad wake install|uninstall|status"
+        )
+
+    head = tokens[0]
+    if head == "list":
+        return cmd_wake_list(as_json)
+    if head == "cancel":
+        if len(tokens) < 2:
+            die("usage: ad wake cancel <id>")
+        return cmd_wake_cancel(tokens[1], as_json)
+    if head == "clear":
+        return cmd_wake_clear(as_json)
+    if head == "daemon":
+        return cmd_wake_daemon(args)
+    if head == "install":
+        install_wake_launchd()
+        print(f"installed launchd agent {WAKE_LAUNCHD_LABEL}")
+        print(f"running={wake_daemon_is_running()}")
+        return 0
+    if head == "uninstall":
+        uninstall_wake_launchd()
+        print(f"uninstalled launchd agent {WAKE_LAUNCHD_LABEL}")
+        return 0
+    if head == "status":
+        running = wake_daemon_is_running()
+        if as_json:
+            print(
+                json.dumps(
+                    {
+                        "label": WAKE_LAUNCHD_LABEL,
+                        "plist": str(wake_plist_path()),
+                        "running": running,
+                        "db": str(WAKE_DB_PATH),
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"label={WAKE_LAUNCHD_LABEL}")
+            print(f"plist={wake_plist_path()}")
+            print(f"running={running}")
+            print(f"db={WAKE_DB_PATH}")
+        return 0 if running else 1
+
+    # Schedule: ad wake <duration> [message...]
+    return cmd_wake_schedule(head, tokens[1:], as_json=as_json)
+
+
 def cmd_whoami(_: argparse.Namespace) -> int:
     label, tab_id, workspace_id = current_identity()
     print(f"label={label}")
@@ -612,7 +1175,15 @@ def skill_md_path() -> Path:
     override = os.environ.get("AD_SKILL_PATH")
     if override:
         return Path(override)
-    return Path.home() / ".pi" / "agent" / "skills" / "ad" / "SKILL.md"
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "skills" / "ad" / "SKILL.md",
+        Path.home() / ".pi" / "agent" / "skills" / "ad" / "SKILL.md",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
 
 
 def cmd_skill(_: argparse.Namespace) -> int:
@@ -742,19 +1313,46 @@ def build_parser() -> argparse.ArgumentParser:
     p_skill = sub.add_parser("skill", help="Print the ad SKILL.md to stdout")
     p_skill.set_defaults(func=cmd_skill)
 
+    p_wake = sub.add_parser(
+        "wake",
+        help="Schedule a durable self-wake (or list/cancel/daemon)",
+    )
+    p_wake.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable output",
+    )
+    p_wake.add_argument(
+        "wake_args",
+        nargs="*",
+        help=(
+            "<duration> [message...] | list | cancel <id> | clear | "
+            "daemon | install | uninstall | status"
+        ),
+    )
+    p_wake.set_defaults(func=cmd_wake)
+
     return parser
 
 
 def preprocess_argv(argv: Optional[Sequence[str]]) -> List[str]:
-    """Allow `ad send <to> -n <msg>` by lifting send flags out of the message tail."""
+    """Normalize argv for send/wake so flags can appear after positionals."""
     if argv is None:
         raw = sys.argv[1:]
     else:
         raw = list(argv)
 
-    if not raw or raw[0] != "send":
+    if not raw:
         return list(raw)
 
+    if raw[0] == "send":
+        return _preprocess_send_argv(raw)
+    if raw[0] == "wake":
+        return _preprocess_wake_argv(raw)
+    return list(raw)
+
+
+def _preprocess_send_argv(raw: List[str]) -> List[str]:
     flags = {
         "-n",
         "--notify",
@@ -795,6 +1393,33 @@ def preprocess_argv(argv: Optional[Sequence[str]]) -> List[str]:
         i += 1
 
     return ["send", *lifted, *rest]
+
+
+def _preprocess_wake_argv(raw: List[str]) -> List[str]:
+    flags = {"--json", "-h", "--help"}
+    lifted: List[str] = []
+    rest: List[str] = []
+    i = 1
+    while i < len(raw):
+        arg = raw[i]
+        if arg in flags:
+            lifted.append(arg)
+            i += 1
+            continue
+        if arg == "--":
+            rest.extend(raw[i + 1 :])
+            break
+        if arg.startswith("-") and arg not in {"-"}:
+            die(
+                f"FAILED — unknown option {arg!r}\n"
+                "  Wake usage:\n"
+                "    ad wake <duration> [message...]\n"
+                "    ad wake list\n"
+                "    ad wake cancel <id>"
+            )
+        rest.append(arg)
+        i += 1
+    return ["wake", *lifted, *rest]
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

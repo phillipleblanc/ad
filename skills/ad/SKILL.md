@@ -1,6 +1,6 @@
 ---
 name: ad
-description: "Send and receive messages between local herdr agents with the `ad` (agent dispatch) CLI. Use only when specifically asked to coordinate with another agent, or when checking/handling your own inbox. Do not send unsolicited messages."
+description: "Send/receive messages and schedule durable self-wakes between local herdr agents with the `ad` CLI. Use only when specifically asked to coordinate with another agent, schedule a wake, or when checking/handling your own inbox. Do not send unsolicited messages."
 ---
 
 # ad — agent dispatch
@@ -67,6 +67,23 @@ ad send cust-segv "Found the SIGSEGV in write path; checking retention next"
 ```
 
 Recipient resolution prefers a matching label in **your current workspace**. Ambiguous labels error out.
+
+## Wake (self-timer)
+
+Schedule a durable reminder for **your current tab**. Returns immediately; a launchd-managed `ad wake daemon` fires the job later by writing your mailbox and using the same notify path as `ad send` (prompt if idle, queue if busy for the stop hook).
+
+```bash
+ad wake 5m "check the build"
+ad wake 1h30m
+ad wake list
+ad wake cancel <id-prefix>
+ad wake clear
+ad wake status
+ad wake install          # install/repair launchd agent
+ad wake uninstall
+```
+
+Jobs are keyed by `tab_id` / `workspace_id` (not cwd). Stored in SQLite at `$AD_HOME/wake.db`. Scheduling auto-starts the daemon if needed.
 
 ## Receive
 

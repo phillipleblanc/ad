@@ -15,9 +15,11 @@ install:
 	ln -sfn "$(REPO)/skills/ad" "$(HOME)/.codex/skills/ad"
 	ln -sfn "$(REPO)/skills/ad" "$(HOME)/.cursor/skills/ad"
 	ln -sfn "$(REPO)/extensions/ad-inbox.ts" "$(PI_AGENT)/extensions/ad-inbox.ts"
+	"$(BINDIR)/ad" wake install
 	@echo "installed ad -> $(BINDIR)/ad"
 
 uninstall:
+	-"$(BINDIR)/ad" wake uninstall
 	rm -f "$(BINDIR)/ad"
 	rm -f "$(PI_AGENT)/skills/ad"
 	rm -f "$(HOME)/.claude/skills/ad"
