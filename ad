@@ -13,9 +13,10 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 DATA_DIR = Path(
     os.environ.get("AD_HOME", Path.home() / ".local" / "share" / "ad")
@@ -519,33 +520,48 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def wake_db() -> sqlite3.Connection:
+@contextmanager
+def wake_db() -> Iterator[sqlite3.Connection]:
+    """Open the wake DB and always close it.
+
+    sqlite3.Connection's own context manager only commits/rollbacks — it does
+    not close. The wake daemon used to open a connection every loop via
+    `with wake_db()`, leaking FDs until SQLite failed with
+    "unable to open database file" and due jobs never fired.
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(WAKE_DB_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS wakes (
-            id TEXT PRIMARY KEY,
-            target_tab_id TEXT NOT NULL,
-            target_workspace_id TEXT NOT NULL,
-            target_label TEXT NOT NULL,
-            message TEXT NOT NULL,
-            due_at INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            fired_at INTEGER,
-            error TEXT
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wakes (
+                id TEXT PRIMARY KEY,
+                target_tab_id TEXT NOT NULL,
+                target_workspace_id TEXT NOT NULL,
+                target_label TEXT NOT NULL,
+                message TEXT NOT NULL,
+                due_at INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                fired_at INTEGER,
+                error TEXT
+            )
+            """
         )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_wakes_pending_due "
-        "ON wakes(status, due_at)"
-    )
-    conn.commit()
-    return conn
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wakes_pending_due "
+            "ON wakes(status, due_at)"
+        )
+        conn.commit()
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def wake_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -943,14 +959,44 @@ def cmd_wake_daemon(_: argparse.Namespace) -> int:
     """Persistent wake worker; intended to run under launchd."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     print(f"ad wake daemon starting (db={WAKE_DB_PATH})", flush=True)
+    # Keep one long-lived connection; reopen only after errors.
+    conn: Optional[sqlite3.Connection] = None
     while True:
         try:
-            with wake_db() as conn:
-                for job in claim_due_wakes(conn):
-                    fire_wake_job(conn, job)
-                nxt = next_pending_due_ms(conn)
+            if conn is None:
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                conn = sqlite3.connect(str(WAKE_DB_PATH), timeout=30)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS wakes ("
+                    "id TEXT PRIMARY KEY,"
+                    "target_tab_id TEXT NOT NULL,"
+                    "target_workspace_id TEXT NOT NULL,"
+                    "target_label TEXT NOT NULL,"
+                    "message TEXT NOT NULL,"
+                    "due_at INTEGER NOT NULL,"
+                    "status TEXT NOT NULL,"
+                    "created_at INTEGER NOT NULL,"
+                    "fired_at INTEGER,"
+                    "error TEXT)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_wakes_pending_due "
+                    "ON wakes(status, due_at)"
+                )
+                conn.commit()
+            for job in claim_due_wakes(conn):
+                fire_wake_job(conn, job)
+            nxt = next_pending_due_ms(conn)
         except Exception as exc:
             print(f"ad wake daemon error: {exc}", file=sys.stderr, flush=True)
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
             time.sleep(1.0)
             continue
 
