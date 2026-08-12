@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+"""ad — agent dispatch: send/receive messages between local herdr agents."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+DATA_DIR = Path(
+    os.environ.get("AD_HOME", Path.home() / ".local" / "share" / "ad")
+)
+
+# Harnesses we can wake via `herdr agent prompt`.
+PROMPTABLE_AGENTS = frozenset({"claude", "codex", "pi"})
+BUSY_STATUSES = frozenset({"working"})
+
+
+class AdError(Exception):
+    """User-facing error."""
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"ad: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def require_herdr() -> None:
+    if os.environ.get("HERDR_ENV") != "1":
+        die("not running under herdr (HERDR_ENV is not set)")
+
+
+def herdr_run(args: Sequence[str]) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            ["herdr", *args],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        die("herdr binary not found on PATH")
+        raise  # unreachable; keeps type-checkers happy
+
+
+def herdr_json(args: Sequence[str]) -> Any:
+    proc = herdr_run(args)
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        die(f"herdr {' '.join(args)} failed: {err}")
+
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        die(f"herdr {' '.join(args)} returned invalid JSON: {exc}")
+
+
+def tab_info(tab_id: str) -> Dict[str, Any]:
+    payload = herdr_json(["tab", "get", tab_id])
+    tab = payload.get("result", {}).get("tab")
+    if not isinstance(tab, dict):
+        die(f"unexpected response from herdr tab get {tab_id}")
+    return tab
+
+
+def list_tabs(workspace_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    args: List[str] = ["tab", "list"]
+    if workspace_id:
+        args.extend(["--workspace", workspace_id])
+    payload = herdr_json(args)
+    tabs = payload.get("result", {}).get("tabs")
+    if not isinstance(tabs, list):
+        die("unexpected response from herdr tab list")
+    return tabs
+
+
+def soft_current_identity() -> Optional[Tuple[str, str, str]]:
+    """Best-effort identity; returns None when not under herdr / unavailable."""
+    if os.environ.get("HERDR_ENV") != "1":
+        return None
+    tab_id = os.environ.get("HERDR_TAB_ID")
+    workspace_id = os.environ.get("HERDR_WORKSPACE_ID")
+    if not tab_id or not workspace_id:
+        return None
+    try:
+        proc = herdr_run(["tab", "get", tab_id])
+        if proc.returncode != 0:
+            return None
+        payload = json.loads(proc.stdout)
+        tab = payload.get("result", {}).get("tab")
+        if not isinstance(tab, dict):
+            return None
+        label = tab.get("label")
+        if not label or not isinstance(label, str):
+            return None
+        return label, tab_id, workspace_id
+    except (OSError, json.JSONDecodeError, SystemExit):
+        return None
+
+
+def current_identity() -> Tuple[str, str, str]:
+    """Return (label, tab_id, workspace_id) for this pane's tab."""
+    require_herdr()
+    tab_id = os.environ.get("HERDR_TAB_ID")
+    workspace_id = os.environ.get("HERDR_WORKSPACE_ID")
+    if not tab_id:
+        die("HERDR_TAB_ID is not set")
+    if not workspace_id:
+        die("HERDR_WORKSPACE_ID is not set")
+
+    tab = tab_info(tab_id)
+    label = tab.get("label")
+    if not label or not isinstance(label, str):
+        die(f"tab {tab_id} has no label")
+    return label, tab_id, workspace_id
+
+
+def drain_own_inbox() -> List[Dict[str, Any]]:
+    """Consume and return pending messages for this tab. Empty if none/unavailable."""
+    identity = soft_current_identity()
+    if identity is None:
+        return []
+    label, _tab_id, workspace_id = identity
+    inbox = mailbox_dir(workspace_id, label)
+    items = load_messages(inbox)
+    messages = [data for _, data in items]
+    for path, _ in items:
+        try:
+            path.unlink()
+        except OSError as exc:
+            print(f"ad: failed to remove {path.name}: {exc}", file=sys.stderr)
+    return messages
+
+
+def format_continue_reason(messages: List[Dict[str, Any]], *, limit: int = 9000) -> str:
+    header = (
+        f"[ad] You have {len(messages)} new agent-dispatch message(s). "
+        "Handle them now before stopping.\n"
+    )
+    body = format_human(messages)
+    text = header + "\n" + body
+    if len(text) <= limit:
+        return text
+    return text[: limit - 20] + "\n…(truncated)…"
+
+
+def sanitize_label(label: str) -> str:
+    """Filesystem-safe form of a tab label (keeps readability)."""
+    cleaned = re.sub(r"[^\w.\-]+", "_", label.strip(), flags=re.UNICODE)
+    cleaned = cleaned.strip("._")
+    if not cleaned:
+        die(f"invalid tab label: {label!r}")
+    return cleaned
+
+
+def mailbox_dir(workspace_id: str, label: str) -> Path:
+    return DATA_DIR / "mailboxes" / workspace_id / sanitize_label(label) / "inbox"
+
+
+def resolve_recipient(label: str, sender_workspace_id: str) -> Dict[str, Any]:
+    # Prefer workspace-scoped listing (herdr 0.8).
+    same_ws = [t for t in list_tabs(sender_workspace_id) if t.get("label") == label]
+    if len(same_ws) == 1:
+        return same_ws[0]
+    if len(same_ws) > 1:
+        ids = ", ".join(str(t.get("tab_id")) for t in same_ws)
+        die(f"ambiguous tab label {label!r} in this workspace: {ids}")
+
+    matches = [t for t in list_tabs() if t.get("label") == label]
+    if not matches:
+        die(f"no tab labeled {label!r}")
+    if len(matches) == 1:
+        return matches[0]
+
+    ids = ", ".join(
+        f"{t.get('tab_id')} (workspace {t.get('workspace_id')})" for t in matches
+    )
+    die(f"ambiguous tab label {label!r} across workspaces: {ids}")
+
+
+def list_agents() -> List[Dict[str, Any]]:
+    payload = herdr_json(["agent", "list"])
+    agents = payload.get("result", {}).get("agents")
+    if not isinstance(agents, list):
+        die("unexpected response from herdr agent list")
+    return agents
+
+
+def agents_in_tab(tab_id: str) -> List[Dict[str, Any]]:
+    return [a for a in list_agents() if a.get("tab_id") == tab_id]
+
+
+def nudge_prompt_text(from_label: str, body: str) -> str:
+    preview = " ".join(body.strip().split())
+    if len(preview) > 160:
+        preview = preview[:157] + "..."
+    # Keep this single-line: herdr agent prompt submits more reliably that way.
+    return (
+        f"[ad] New message from {from_label}. "
+        f"Run `ad receive` and handle it. Preview: {preview}"
+    )
+
+
+def prompt_target(agent: Dict[str, Any]) -> str:
+    """herdr 0.8 prefers unique live agent name; fall back to pane id."""
+    name = agent.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    pane_id = agent.get("pane_id")
+    if isinstance(pane_id, str) and pane_id:
+        return pane_id
+    return ""
+
+
+def agent_snapshot(pane_id: str) -> Optional[Dict[str, Any]]:
+    proc = herdr_run(["agent", "get", pane_id])
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    agent = payload.get("result", {}).get("agent")
+    return agent if isinstance(agent, dict) else None
+
+
+def prompt_accepted(before: Dict[str, Any], after: Optional[Dict[str, Any]]) -> bool:
+    """True if the agent left idle after a prompt submission."""
+    if not after:
+        return False
+    status = str(after.get("agent_status") or "")
+    if status == "working":
+        return True
+    before_seq = before.get("state_change_seq")
+    after_seq = after.get("state_change_seq")
+    if (
+        isinstance(before_seq, int)
+        and isinstance(after_seq, int)
+        and after_seq > before_seq
+        and status in {"working", "blocked", "done"}
+    ):
+        return True
+    return False
+
+
+def wait_for_prompt_accepted(
+    pane_id: str,
+    before: Dict[str, Any],
+    timeout_s: float = 5.0,
+) -> Optional[Dict[str, Any]]:
+    deadline = time.monotonic() + timeout_s
+    latest: Optional[Dict[str, Any]] = None
+    while time.monotonic() < deadline:
+        latest = agent_snapshot(pane_id)
+        if prompt_accepted(before, latest):
+            return latest
+        time.sleep(0.25)
+    return latest
+
+
+def notify_recipient(
+    tab_id: str,
+    from_label: str,
+    body: str,
+    *,
+    force: bool,
+) -> List[Dict[str, Any]]:
+    """Prompt claude/codex/pi agents in the recipient tab to check their inbox.
+
+    Returns a list of notify attempt records for logging / --json.
+    """
+    results: List[Dict[str, Any]] = []
+    agents = agents_in_tab(tab_id)
+    if not agents:
+        results.append(
+            {
+                "ok": False,
+                "reason": "no_agent_in_tab",
+                "detail": f"no detected agent in tab {tab_id}",
+            }
+        )
+        return results
+
+    promptable = [a for a in agents if a.get("agent") in PROMPTABLE_AGENTS]
+    if not promptable:
+        kinds = sorted({str(a.get("agent") or "unknown") for a in agents})
+        results.append(
+            {
+                "ok": False,
+                "reason": "unsupported_agent",
+                "detail": (
+                    "notify supports only claude/codex/pi; "
+                    f"found: {', '.join(kinds)}"
+                ),
+                "agents": kinds,
+            }
+        )
+        return results
+
+    prompt = nudge_prompt_text(from_label, body)
+    for agent in promptable:
+        kind = str(agent.get("agent"))
+        pane_id = str(agent.get("pane_id") or "")
+        target = prompt_target(agent)
+        status = str(agent.get("agent_status") or "unknown")
+        record: Dict[str, Any] = {
+            "agent": kind,
+            "pane_id": pane_id,
+            "target": target,
+            "status": status,
+        }
+        if not target:
+            record.update({"ok": False, "reason": "missing_target"})
+            results.append(record)
+            continue
+        if status in BUSY_STATUSES and not force:
+            record.update(
+                {
+                    "ok": False,
+                    "reason": "busy",
+                    "detail": (
+                        f"{kind} is {status}; skipped "
+                        "(rerun with --force to interrupt)"
+                    ),
+                }
+            )
+            results.append(record)
+            continue
+
+        before = agent_snapshot(pane_id) or agent
+        proc = herdr_run(["agent", "prompt", target, prompt])
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+            record.update({"ok": False, "reason": "prompt_failed", "detail": err})
+            results.append(record)
+            continue
+
+        if proc.stdout.strip():
+            try:
+                record["response"] = json.loads(proc.stdout)
+            except json.JSONDecodeError:
+                record["response_text"] = proc.stdout.strip()
+
+        # herdr can ack a prompt that never starts a turn (composer stall).
+        # Confirm a lifecycle change; if still idle, press Enter once (#1878).
+        after = wait_for_prompt_accepted(pane_id, before, timeout_s=5.0)
+        if prompt_accepted(before, after):
+            record["ok"] = True
+            if after:
+                record["status_after"] = after.get("agent_status")
+            results.append(record)
+            continue
+
+        enter = herdr_run(["agent", "send-keys", target, "Enter"])
+        if enter.returncode != 0:
+            err = (enter.stderr or enter.stdout or "").strip() or f"exit {enter.returncode}"
+            record.update(
+                {
+                    "ok": False,
+                    "reason": "prompt_stalled",
+                    "detail": (
+                        "prompt submitted but agent stayed idle; "
+                        f"Enter recovery failed: {err}"
+                    ),
+                }
+            )
+            results.append(record)
+            continue
+
+        after = wait_for_prompt_accepted(pane_id, before, timeout_s=3.0)
+        if prompt_accepted(before, after):
+            record["ok"] = True
+            record["recovered_with"] = "send-keys Enter"
+            if after:
+                record["status_after"] = after.get("agent_status")
+        else:
+            record.update(
+                {
+                    "ok": False,
+                    "reason": "prompt_stalled",
+                    "detail": (
+                        "prompt submitted but agent stayed idle "
+                        "(message remains in mailbox for stop-hook)"
+                    ),
+                    "status_after": (after or {}).get("agent_status"),
+                }
+            )
+        results.append(record)
+
+    return results
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def write_message(inbox: Path, message: Dict[str, Any]) -> Path:
+    ensure_dir(inbox)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    filename = f"{ts}_{message['id']}.json"
+    dest = inbox / filename
+
+    # Atomic create: write temp in same dir, then rename.
+    fd, tmp_name = tempfile.mkstemp(prefix=".ad-", suffix=".tmp", dir=str(inbox))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(message, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, dest)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return dest
+
+
+def load_messages(inbox: Path) -> List[Tuple[Path, Dict[str, Any]]]:
+    if not inbox.exists():
+        return []
+    items: List[Tuple[Path, Dict[str, Any]]] = []
+    for path in sorted(inbox.glob("*.json")):
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"ad: skipping corrupt message {path.name}: {exc}", file=sys.stderr)
+            continue
+        if not isinstance(data, dict):
+            print(f"ad: skipping invalid message {path.name}", file=sys.stderr)
+            continue
+        items.append((path, data))
+    return items
+
+
+def format_human(messages: List[Dict[str, Any]]) -> str:
+    if not messages:
+        return "(no messages)"
+    blocks = []
+    for i, msg in enumerate(messages, start=1):
+        fr = msg.get("from", "?")
+        sent = msg.get("sent_at", "?")
+        body = msg.get("body", "")
+        blocks.append(f"[{i}] from={fr} at={sent}\n{body}")
+    return "\n\n".join(blocks)
+
+
+def cmd_whoami(_: argparse.Namespace) -> int:
+    label, tab_id, workspace_id = current_identity()
+    print(f"label={label}")
+    print(f"tab_id={tab_id}")
+    print(f"workspace_id={workspace_id}")
+    print(f"mailbox={mailbox_dir(workspace_id, label)}")
+    return 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    from_label, from_tab_id, workspace_id = current_identity()
+    body = " ".join(args.message)
+    if not body and not sys.stdin.isatty():
+        body = sys.stdin.read()
+    if not body.strip():
+        die(
+            "message body is empty\n"
+            "  Examples:\n"
+            "    ad send <tab> hello there\n"
+            "    echo 'hello there' | ad send <tab>"
+        )
+
+    recipient = resolve_recipient(args.to, workspace_id)
+    to_label = recipient["label"]
+    to_workspace = recipient["workspace_id"]
+    to_tab_id = recipient["tab_id"]
+
+    message = {
+        "id": str(uuid.uuid4()),
+        "from": from_label,
+        "from_tab_id": from_tab_id,
+        "from_workspace_id": workspace_id,
+        "to": to_label,
+        "to_tab_id": to_tab_id,
+        "to_workspace_id": to_workspace,
+        "body": body,
+        "sent_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+    path = write_message(mailbox_dir(to_workspace, to_label), message)
+
+    # Notify by default so idle agents wake up. --no-notify opts out.
+    # -n/--notify is accepted for backwards compatibility (same as default).
+    notify_results: Optional[List[Dict[str, Any]]] = None
+    if not args.no_notify:
+        notify_results = notify_recipient(
+            to_tab_id, from_label, body, force=args.force
+        )
+
+    if args.json:
+        payload: Dict[str, Any] = {
+            "ok": True,
+            "path": str(path),
+            "message": message,
+        }
+        if notify_results is not None:
+            payload["notify"] = notify_results
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"sent to {to_label} ({to_tab_id})")
+        if notify_results is not None:
+            for item in notify_results:
+                if item.get("ok"):
+                    print(
+                        f"notified {item.get('agent')} "
+                        f"({item.get('pane_id')})"
+                    )
+                else:
+                    reason = item.get("detail") or item.get("reason") or "failed"
+                    target = item.get("agent") or "recipient"
+                    print(f"notify skipped/failed for {target}: {reason}", file=sys.stderr)
+    return 0
+
+
+def cmd_receive(args: argparse.Namespace) -> int:
+    label, _tab_id, workspace_id = current_identity()
+    inbox = mailbox_dir(workspace_id, label)
+    items = load_messages(inbox)
+    messages = [data for _, data in items]
+
+    if args.json:
+        print(json.dumps(messages, indent=2))
+    else:
+        print(format_human(messages))
+
+    if not args.peek:
+        for path, _ in items:
+            try:
+                path.unlink()
+            except OSError as exc:
+                print(f"ad: failed to remove {path.name}: {exc}", file=sys.stderr)
+
+    return 0
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    """Block until at least one message is available, then receive."""
+    label, _tab_id, workspace_id = current_identity()
+    inbox = mailbox_dir(workspace_id, label)
+    deadline = None if args.timeout is None else time.monotonic() + args.timeout
+
+    while True:
+        items = load_messages(inbox)
+        if items:
+            # Reuse receive formatting/consume path.
+            ns = argparse.Namespace(peek=args.peek, json=args.json)
+            return cmd_receive(ns)
+        if deadline is not None and time.monotonic() >= deadline:
+            if args.json:
+                print("[]")
+            else:
+                print("(no messages)")
+            return 1
+        time.sleep(args.poll)
+
+
+def cmd_stop_hook(args: argparse.Namespace) -> int:
+    """Claude/Codex Stop hook: continue the turn when the inbox has mail.
+
+    Fail-open: any error or empty inbox allows the agent to stop (exit 0, no JSON).
+    """
+    hook_input: Dict[str, Any] = {}
+    try:
+        raw = sys.stdin.read()
+        if raw.strip():
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                hook_input = parsed
+    except json.JSONDecodeError:
+        hook_input = {}
+
+    # Claude re-invokes Stop after a block; bail out to avoid loops.
+    if args.harness == "claude" and hook_input.get("stop_hook_active"):
+        return 0
+
+    try:
+        messages = drain_own_inbox()
+    except Exception as exc:
+        print(f"ad stop-hook: {exc}", file=sys.stderr)
+        return 0
+
+    if not messages:
+        return 0
+
+    reason = format_continue_reason(messages)
+    # Codex Stop schema is strict — only decision/reason (plus common fields).
+    # Claude accepts the same shape.
+    print(json.dumps({"decision": "block", "reason": reason}))
+    return 0
+
+
+def skill_md_path() -> Path:
+    override = os.environ.get("AD_SKILL_PATH")
+    if override:
+        return Path(override)
+    return Path.home() / ".pi" / "agent" / "skills" / "ad" / "SKILL.md"
+
+
+def cmd_skill(_: argparse.Namespace) -> int:
+    path = skill_md_path()
+    try:
+        sys.stdout.write(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        die(f"failed to read skill file {path}: {exc}")
+    return 0
+
+
+class AdArgumentParser(argparse.ArgumentParser):
+    """Fail loudly; never let argparse echo look like a successful send."""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        if "unrecognized arguments" in message:
+            unknown = message.split("unrecognized arguments:", 1)[-1].strip()
+            print("ad: FAILED — invalid arguments (nothing was sent)", file=sys.stderr)
+            if unknown.startswith("-"):
+                opt = unknown.split()[0]
+                print(f"ad: unknown option {opt!r}", file=sys.stderr)
+                if opt in {"-m", "--message"} or opt.startswith("--message="):
+                    print(
+                        "ad: there is no --message flag. "
+                        "Pass the text as a positional argument or via stdin.",
+                        file=sys.stderr,
+                    )
+            else:
+                print(f"ad: {message}", file=sys.stderr)
+            print(
+                "ad: send usage:\n"
+                "  ad send <tab> <message text...>\n"
+                "  echo '<message text>' | ad send <tab>",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        print(f"ad: FAILED — {message}", file=sys.stderr)
+        print(f"ad: usage: {self.format_usage().strip()}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = AdArgumentParser(
+        prog="ad",
+        description="Agent dispatch — send messages between local herdr agents.",
+    )
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True,
+        parser_class=AdArgumentParser,
+    )
+
+    p_who = sub.add_parser("whoami", help="Show this agent's herdr tab identity")
+    p_who.set_defaults(func=cmd_whoami)
+
+    p_send = sub.add_parser("send", help="Send a message to a tab by label")
+    p_send.add_argument(
+        "-n",
+        "--notify",
+        action="store_true",
+        help=(
+            "Wake the recipient if idle (default; kept for compatibility). "
+            "Uses `herdr agent prompt` for claude/codex/pi."
+        ),
+    )
+    p_send.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="Mailbox only; do not prompt the recipient agent",
+    )
+    p_send.add_argument(
+        "--force",
+        action="store_true",
+        help="Prompt even if the recipient agent is working",
+    )
+    p_send.add_argument("--json", action="store_true", help="Print machine-readable output")
+    p_send.add_argument("to", help="Recipient tab label (e.g. agent-message)")
+    p_send.add_argument(
+        "message",
+        nargs="*",
+        help="Message text (or pipe via stdin)",
+    )
+    p_send.set_defaults(func=cmd_send)
+
+    p_recv = sub.add_parser("receive", help="Receive pending messages for this tab")
+    p_recv.add_argument(
+        "--peek",
+        action="store_true",
+        help="Show messages without consuming them",
+    )
+    p_recv.add_argument("--json", action="store_true", help="Print messages as JSON")
+    p_recv.set_defaults(func=cmd_receive)
+
+    p_wait = sub.add_parser("wait", help="Wait for a message, then receive it")
+    p_wait.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Seconds to wait before giving up (default: forever)",
+    )
+    p_wait.add_argument(
+        "--poll",
+        type=float,
+        default=0.5,
+        help="Polling interval in seconds (default: 0.5)",
+    )
+    p_wait.add_argument(
+        "--peek",
+        action="store_true",
+        help="Show messages without consuming them",
+    )
+    p_wait.add_argument("--json", action="store_true", help="Print messages as JSON")
+    p_wait.set_defaults(func=cmd_wait)
+
+    p_stop = sub.add_parser(
+        "stop-hook",
+        help="Stop-hook helper for claude/codex (continue turn if inbox has mail)",
+    )
+    p_stop.add_argument(
+        "--harness",
+        choices=("claude", "codex"),
+        required=True,
+        help="Which agent harness is invoking this hook",
+    )
+    p_stop.set_defaults(func=cmd_stop_hook)
+
+    p_skill = sub.add_parser("skill", help="Print the ad SKILL.md to stdout")
+    p_skill.set_defaults(func=cmd_skill)
+
+    return parser
+
+
+def preprocess_argv(argv: Optional[Sequence[str]]) -> List[str]:
+    """Allow `ad send <to> -n <msg>` by lifting send flags out of the message tail."""
+    if argv is None:
+        raw = sys.argv[1:]
+    else:
+        raw = list(argv)
+
+    if not raw or raw[0] != "send":
+        return list(raw)
+
+    flags = {
+        "-n",
+        "--notify",
+        "--no-notify",
+        "--force",
+        "--json",
+        "-h",
+        "--help",
+    }
+    lifted: List[str] = []
+    rest: List[str] = []
+    i = 1
+    while i < len(raw):
+        arg = raw[i]
+        if arg in flags:
+            lifted.append(arg)
+            i += 1
+            continue
+        if arg == "--":
+            rest.extend(raw[i + 1 :])
+            break
+        # Catch mistaken flags early with a clear failure (before argparse).
+        if arg.startswith("-") and arg not in {"-"}:
+            hint = (
+                "  There is no --message/-m flag.\n"
+                if arg in {"-m", "--message"} or arg.startswith("--message=")
+                else ""
+            )
+            die(
+                f"FAILED — unknown option {arg!r} (nothing was sent)\n"
+                f"{hint}"
+                "  Pass the message as a positional argument or via stdin.\n"
+                "  Examples:\n"
+                "    ad send <tab> hello there\n"
+                "    echo 'hello there' | ad send <tab>"
+            )
+        rest.append(arg)
+        i += 1
+
+    return ["send", *lifted, *rest]
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(preprocess_argv(argv))
+    try:
+        return int(args.func(args))
+    except AdError as exc:
+        die(str(exc))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
