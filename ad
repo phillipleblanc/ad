@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -29,8 +30,21 @@ BUSY_STATUSES = frozenset({"working"})
 WAKE_DB_PATH = DATA_DIR / "wake.db"
 WAKE_LAUNCHD_LABEL = "tech.leblanc.ad.wake"
 WAKE_DEFAULT_MESSAGE = "continue"
+WAKE_KIND_TIMER = "timer"
+WAKE_KIND_SCRIPT = "script"
+WAKE_SCRIPT_LOG_DIR = DATA_DIR / "wake-scripts"
 WAKE_SUBCOMMANDS = frozenset(
     {"list", "cancel", "clear", "daemon", "install", "uninstall", "status"}
+)
+WAKE_USAGE = (
+    "wake usage:\n"
+    "  ad wake <duration> [message...]\n"
+    "  ad wake <script> [message...]\n"
+    "  ad wake list\n"
+    "  ad wake cancel <id>\n"
+    "  ad wake clear\n"
+    "  ad wake daemon\n"
+    "  ad wake install|uninstall|status"
 )
 
 
@@ -482,10 +496,10 @@ def format_human(messages: List[Dict[str, Any]]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def parse_duration_ms(raw: str) -> int:
+def try_parse_duration_ms(raw: str) -> Optional[int]:
     compact = raw.strip().lower().replace(" ", "")
     if not compact:
-        die("duration is required (examples: 30s, 2m, 1h30m)")
+        return None
     unit_ms = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
     pattern = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h|d)")
     total = 0.0
@@ -493,18 +507,47 @@ def parse_duration_ms(raw: str) -> int:
     matched = False
     for match in pattern.finditer(compact):
         if match.start() != index:
-            die(f"invalid duration {raw!r} (examples: 30s, 2m, 1h30m)")
+            return None
         matched = True
         amount = float(match.group(1))
         if amount < 0:
-            die(f"invalid duration amount {match.group(1)!r}")
+            return None
         total += amount * unit_ms[match.group(2)]
         index = match.end()
-    if not matched or index != len(compact):
-        die(f"invalid duration {raw!r} (examples: 30s, 2m, 1h30m)")
-    if total <= 0:
-        die("duration must be greater than zero")
+    if not matched or index != len(compact) or total <= 0:
+        return None
     return int(total + 0.999999)  # ceil without importing math
+
+
+def parse_duration_ms(raw: str) -> int:
+    parsed = try_parse_duration_ms(raw)
+    if parsed is None:
+        die(f"invalid duration {raw!r} (examples: 30s, 2m, 1h30m)")
+    return parsed
+
+
+def looks_like_script_arg(raw: str) -> bool:
+    if not raw or raw in WAKE_SUBCOMMANDS:
+        return False
+    expanded = Path(raw).expanduser()
+    if expanded.is_file():
+        return True
+    if raw.startswith(("./", "../", "/", "~")) or "/" in raw:
+        return True
+    return Path(raw).suffix.lower() in {".sh", ".bash", ".zsh", ".fish", ".py", ".rb"}
+
+
+def resolve_wake_script(raw: str) -> Path:
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    try:
+        path = path.resolve()
+    except OSError as exc:
+        die(f"wake script {raw!r} could not be resolved: {exc}")
+    if not path.is_file():
+        die(f"wake script not found: {raw}")
+    return path
 
 
 def format_duration_ms(ms: int) -> str:
@@ -531,6 +574,46 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def ensure_wake_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wakes (
+            id TEXT PRIMARY KEY,
+            target_tab_id TEXT NOT NULL,
+            target_workspace_id TEXT NOT NULL,
+            target_label TEXT NOT NULL,
+            message TEXT NOT NULL,
+            due_at INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            fired_at INTEGER,
+            error TEXT,
+            kind TEXT NOT NULL DEFAULT 'timer',
+            script_path TEXT,
+            script_pid INTEGER,
+            script_cwd TEXT,
+            script_exit INTEGER
+        )
+        """
+    )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(wakes)")}
+    migrations = (
+        ("kind", "TEXT NOT NULL DEFAULT 'timer'"),
+        ("script_path", "TEXT"),
+        ("script_pid", "INTEGER"),
+        ("script_cwd", "TEXT"),
+        ("script_exit", "INTEGER"),
+    )
+    for name, decl in migrations:
+        if name not in columns:
+            conn.execute(f"ALTER TABLE wakes ADD COLUMN {name} {decl}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wakes_pending_due "
+        "ON wakes(status, due_at)"
+    )
+    conn.commit()
+
+
 @contextmanager
 def wake_db() -> Iterator[sqlite3.Connection]:
     """Open the wake DB and always close it.
@@ -545,27 +628,7 @@ def wake_db() -> Iterator[sqlite3.Connection]:
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS wakes (
-                id TEXT PRIMARY KEY,
-                target_tab_id TEXT NOT NULL,
-                target_workspace_id TEXT NOT NULL,
-                target_label TEXT NOT NULL,
-                message TEXT NOT NULL,
-                due_at INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                fired_at INTEGER,
-                error TEXT
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_wakes_pending_due "
-            "ON wakes(status, due_at)"
-        )
-        conn.commit()
+        ensure_wake_schema(conn)
         yield conn
         conn.commit()
     except Exception:
@@ -576,18 +639,7 @@ def wake_db() -> Iterator[sqlite3.Connection]:
 
 
 def wake_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    return {
-        "id": row["id"],
-        "target_tab_id": row["target_tab_id"],
-        "target_workspace_id": row["target_workspace_id"],
-        "target_label": row["target_label"],
-        "message": row["message"],
-        "due_at": row["due_at"],
-        "status": row["status"],
-        "created_at": row["created_at"],
-        "fired_at": row["fired_at"],
-        "error": row["error"],
-    }
+    return {key: row[key] for key in row.keys()}
 
 
 def resolve_wake_id(conn: sqlite3.Connection, prefix: str) -> str:
@@ -643,6 +695,193 @@ def deliver_to_tab(
     return {"path": str(path), "message": message, "notify": notify_results}
 
 
+def script_log_path(job_id: str) -> Path:
+    return WAKE_SCRIPT_LOG_DIR / f"{job_id}.log"
+
+
+def pid_is_alive(pid: Optional[int]) -> bool:
+    if pid is None or int(pid) <= 0:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def kill_process_group(pid: Optional[int]) -> None:
+    if pid is None or int(pid) <= 0:
+        return
+    pid = int(pid)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                return
+        if sig == signal.SIGTERM:
+            time.sleep(0.15)
+            if not pid_is_alive(pid):
+                return
+
+
+def read_log_tail(path: Path, max_bytes: int = 8000) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    if len(data) > max_bytes:
+        data = data[-max_bytes:]
+        text = data.decode("utf-8", errors="replace")
+        nl = text.find("\n")
+        if nl >= 0:
+            text = text[nl + 1 :]
+        return "…\n" + text
+    return data.decode("utf-8", errors="replace")
+
+
+def format_script_completion_message(
+    job: Dict[str, Any], exit_code: Optional[int]
+) -> str:
+    body = str(job.get("message") or "").rstrip()
+    path = job.get("script_path") or "script"
+    if exit_code is None:
+        status_line = f"[ad wake] {path} finished (exit code unknown)"
+    else:
+        status_line = f"[ad wake] {path} exited {exit_code}"
+    parts = [body, "", status_line] if body else [status_line]
+    output = read_log_tail(script_log_path(job["id"]))
+    if output.strip():
+        parts.extend(["output:", output.rstrip()])
+    return "\n".join(parts)
+
+
+def spawn_wake_script(job: Dict[str, Any]) -> subprocess.Popen:
+    script = Path(str(job["script_path"]))
+    cwd = job.get("script_cwd") or str(script.parent)
+    WAKE_SCRIPT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = script_log_path(job["id"])
+    if os.access(script, os.X_OK):
+        argv = [str(script)]
+    else:
+        argv = ["/bin/bash", str(script)]
+    log_fh = log_path.open("w", encoding="utf-8")
+    try:
+        return subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        log_fh.close()
+
+
+def start_pending_script_wakes(
+    conn: sqlite3.Connection,
+    children: Dict[str, subprocess.Popen],
+) -> None:
+    rows = list(
+        conn.execute(
+            "SELECT * FROM wakes WHERE COALESCE(kind, 'timer') = ? "
+            "AND status = 'pending'",
+            (WAKE_KIND_SCRIPT,),
+        )
+    )
+    for row in rows:
+        cur = conn.execute(
+            "UPDATE wakes SET status = 'running' "
+            "WHERE id = ? AND status = 'pending'",
+            (row["id"],),
+        )
+        conn.commit()
+        if cur.rowcount != 1:
+            continue
+        job = wake_row_to_dict(row)
+        try:
+            proc = spawn_wake_script(job)
+        except Exception as exc:
+            conn.execute(
+                "UPDATE wakes SET status = ?, fired_at = ?, error = ? WHERE id = ?",
+                ("fired", now_ms(), f"failed to start script: {exc}", job["id"]),
+            )
+            conn.commit()
+            print(
+                f"ad wake: script start failed {job['id'][:8]}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+        conn.execute(
+            "UPDATE wakes SET script_pid = ? WHERE id = ?",
+            (proc.pid, job["id"]),
+        )
+        conn.commit()
+        children[job["id"]] = proc
+        print(
+            f"ad wake: started script {job['id'][:8]} pid={proc.pid} "
+            f"{job.get('script_path')}",
+            flush=True,
+        )
+
+
+def reap_script_wakes(
+    conn: sqlite3.Connection,
+    children: Dict[str, subprocess.Popen],
+) -> None:
+    rows = list(
+        conn.execute(
+            "SELECT * FROM wakes WHERE COALESCE(kind, 'timer') = ? "
+            "AND status IN ('running', 'cancelled')",
+            (WAKE_KIND_SCRIPT,),
+        )
+    )
+    for row in rows:
+        job = wake_row_to_dict(row)
+        job_id = job["id"]
+        proc = children.get(job_id)
+        if job["status"] == "cancelled":
+            if proc is not None:
+                kill_process_group(proc.pid)
+                children.pop(job_id, None)
+            elif job.get("script_pid"):
+                kill_process_group(job.get("script_pid"))
+            continue
+
+        exit_code: Optional[int] = None
+        done = False
+        if proc is not None:
+            code = proc.poll()
+            if code is not None:
+                done = True
+                exit_code = int(code)
+        else:
+            pid = job.get("script_pid")
+            if pid_is_alive(pid):
+                continue
+            done = True
+        if not done:
+            continue
+        children.pop(job_id, None)
+        cur = conn.execute(
+            "UPDATE wakes SET status = 'firing', script_exit = ? "
+            "WHERE id = ? AND status = 'running'",
+            (exit_code, job_id),
+        )
+        conn.commit()
+        if cur.rowcount != 1:
+            continue
+        job["message"] = format_script_completion_message(job, exit_code)
+        fire_wake_job(conn, job)
+
+
 def fire_wake_job(conn: sqlite3.Connection, job: Dict[str, Any]) -> None:
     job_id = job["id"]
     try:
@@ -683,9 +922,10 @@ def claim_due_wakes(conn: sqlite3.Connection, limit: int = 20) -> List[Dict[str,
     due = now_ms()
     rows = list(
         conn.execute(
-            "SELECT * FROM wakes WHERE status = 'pending' AND due_at <= ? "
+            "SELECT * FROM wakes WHERE status = 'pending' "
+            "AND COALESCE(kind, 'timer') = ? AND due_at <= ? "
             "ORDER BY due_at ASC LIMIT ?",
-            (due, limit),
+            (WAKE_KIND_TIMER, due, limit),
         )
     )
     claimed: List[Dict[str, Any]] = []
@@ -703,11 +943,28 @@ def claim_due_wakes(conn: sqlite3.Connection, limit: int = 20) -> List[Dict[str,
 
 def next_pending_due_ms(conn: sqlite3.Connection) -> Optional[int]:
     row = conn.execute(
-        "SELECT MIN(due_at) AS due_at FROM wakes WHERE status = 'pending'"
+        "SELECT MIN(due_at) AS due_at FROM wakes "
+        "WHERE status = 'pending' AND COALESCE(kind, 'timer') = ?",
+        (WAKE_KIND_TIMER,),
     ).fetchone()
     if not row or row["due_at"] is None:
         return None
     return int(row["due_at"])
+
+
+def next_wake_sleep_s(conn: sqlite3.Connection) -> float:
+    script_active = conn.execute(
+        "SELECT 1 FROM wakes WHERE COALESCE(kind, 'timer') = ? "
+        "AND status IN ('pending', 'running') LIMIT 1",
+        (WAKE_KIND_SCRIPT,),
+    ).fetchone()
+    sleeps = [1.0]
+    if script_active is not None:
+        sleeps.append(0.4)
+    nxt = next_pending_due_ms(conn)
+    if nxt is not None:
+        sleeps.append(max(0.05, min(1.0, (nxt - now_ms()) / 1000.0)))
+    return min(sleeps)
 
 
 def ad_executable() -> str:
@@ -874,14 +1131,24 @@ def cmd_wake_schedule(duration_raw: str, message_parts: Sequence[str], *, as_jso
         conn.execute(
             "INSERT INTO wakes ("
             "id, target_tab_id, target_workspace_id, target_label, message, "
-            "due_at, status, created_at, fired_at, error"
-            ") VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)",
-            (job_id, tab_id, workspace_id, label, body, due, created),
+            "due_at, status, created_at, fired_at, error, kind"
+            ") VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, ?)",
+            (
+                job_id,
+                tab_id,
+                workspace_id,
+                label,
+                body,
+                due,
+                created,
+                WAKE_KIND_TIMER,
+            ),
         )
         conn.commit()
 
     job = {
         "id": job_id,
+        "kind": WAKE_KIND_TIMER,
         "target_tab_id": tab_id,
         "target_workspace_id": workspace_id,
         "target_label": label,
@@ -902,13 +1169,66 @@ def cmd_wake_schedule(duration_raw: str, message_parts: Sequence[str], *, as_jso
     return 0
 
 
+def cmd_wake_script(script_raw: str, message_parts: Sequence[str], *, as_json: bool) -> int:
+    label, tab_id, workspace_id = current_identity()
+    body = " ".join(message_parts).strip() or WAKE_DEFAULT_MESSAGE
+    script = resolve_wake_script(script_raw)
+    job_id = str(uuid.uuid4())
+    created = now_ms()
+    cwd = str(Path.cwd())
+
+    ensure_wake_daemon()
+    with wake_db() as conn:
+        conn.execute(
+            "INSERT INTO wakes ("
+            "id, target_tab_id, target_workspace_id, target_label, message, "
+            "due_at, status, created_at, fired_at, error, kind, "
+            "script_path, script_cwd"
+            ") VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, ?, ?, ?)",
+            (
+                job_id,
+                tab_id,
+                workspace_id,
+                label,
+                body,
+                created,
+                created,
+                WAKE_KIND_SCRIPT,
+                str(script),
+                cwd,
+            ),
+        )
+        conn.commit()
+
+    job = {
+        "id": job_id,
+        "kind": WAKE_KIND_SCRIPT,
+        "target_tab_id": tab_id,
+        "target_workspace_id": workspace_id,
+        "target_label": label,
+        "message": body,
+        "due_at": created,
+        "status": "pending",
+        "created_at": created,
+        "script_path": str(script),
+        "script_cwd": cwd,
+    }
+    if as_json:
+        print(json.dumps({"ok": True, "job": job}, indent=2))
+    else:
+        print(f"wake {job_id[:8]} when {script} exits, for {label}")
+        print(f"message: {body}")
+    return 0
+
+
 def cmd_wake_list(as_json: bool) -> int:
     with wake_db() as conn:
         rows = [
             wake_row_to_dict(r)
             for r in conn.execute(
-                "SELECT * FROM wakes WHERE status IN ('pending', 'firing') "
-                "ORDER BY due_at ASC"
+                "SELECT * FROM wakes WHERE status IN ('pending', 'firing', 'running') "
+                "ORDER BY CASE COALESCE(kind, 'timer') WHEN 'script' THEN 0 ELSE 1 END, "
+                "due_at ASC"
             )
         ]
     if as_json:
@@ -919,14 +1239,22 @@ def cmd_wake_list(as_json: bool) -> int:
         return 0
     now = now_ms()
     for job in rows:
-        remaining = job["due_at"] - now
-        eta = (
-            f"in {format_duration_ms(remaining)}"
-            if remaining > 0
-            else "due"
-        )
+        kind = job.get("kind") or WAKE_KIND_TIMER
+        if kind == WAKE_KIND_SCRIPT:
+            eta = "running" if job["status"] == "running" else "script"
+            detail = job.get("script_path") or ""
+            msg = job["message"]
+            text = f"{detail} — {msg}" if detail else msg
+        else:
+            remaining = job["due_at"] - now
+            eta = (
+                f"in {format_duration_ms(remaining)}"
+                if remaining > 0
+                else "due"
+            )
+            text = job["message"]
         print(
-            f"{job['id'][:8]}  {eta:12}  {job['target_label']:20}  {job['message']}"
+            f"{job['id'][:8]}  {eta:12}  {job['target_label']:20}  {text}"
         )
     return 0
 
@@ -937,13 +1265,16 @@ def cmd_wake_cancel(prefix: str, as_json: bool) -> int:
         row = conn.execute("SELECT * FROM wakes WHERE id = ?", (job_id,)).fetchone()
         if row is None:
             die(f"no wake job {prefix!r}")
-        if row["status"] not in {"pending", "firing"}:
+        if row["status"] not in {"pending", "firing", "running"}:
             die(f"wake {job_id[:8]} is {row['status']}, not cancellable")
+        pid = row["script_pid"] if "script_pid" in row.keys() else None
         conn.execute(
             "UPDATE wakes SET status = 'cancelled' WHERE id = ?",
             (job_id,),
         )
         conn.commit()
+    if pid:
+        kill_process_group(pid)
     if as_json:
         print(json.dumps({"ok": True, "id": job_id, "status": "cancelled"}, indent=2))
     else:
@@ -953,12 +1284,22 @@ def cmd_wake_cancel(prefix: str, as_json: bool) -> int:
 
 def cmd_wake_clear(as_json: bool) -> int:
     with wake_db() as conn:
+        pids = [
+            r["script_pid"]
+            for r in conn.execute(
+                "SELECT script_pid FROM wakes "
+                "WHERE status IN ('pending', 'firing', 'running') "
+                "AND script_pid IS NOT NULL"
+            )
+        ]
         cur = conn.execute(
             "UPDATE wakes SET status = 'cancelled' "
-            "WHERE status IN ('pending', 'firing')"
+            "WHERE status IN ('pending', 'firing', 'running')"
         )
         conn.commit()
         n = cur.rowcount
+    for pid in pids:
+        kill_process_group(pid)
     if as_json:
         print(json.dumps({"ok": True, "cancelled": n}, indent=2))
     else:
@@ -972,6 +1313,7 @@ def cmd_wake_daemon(_: argparse.Namespace) -> int:
     print(f"ad wake daemon starting (db={WAKE_DB_PATH})", flush=True)
     # Keep one long-lived connection; reopen only after errors.
     conn: Optional[sqlite3.Connection] = None
+    children: Dict[str, subprocess.Popen] = {}
     while True:
         try:
             if conn is None:
@@ -979,27 +1321,12 @@ def cmd_wake_daemon(_: argparse.Namespace) -> int:
                 conn = sqlite3.connect(str(WAKE_DB_PATH), timeout=30)
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS wakes ("
-                    "id TEXT PRIMARY KEY,"
-                    "target_tab_id TEXT NOT NULL,"
-                    "target_workspace_id TEXT NOT NULL,"
-                    "target_label TEXT NOT NULL,"
-                    "message TEXT NOT NULL,"
-                    "due_at INTEGER NOT NULL,"
-                    "status TEXT NOT NULL,"
-                    "created_at INTEGER NOT NULL,"
-                    "fired_at INTEGER,"
-                    "error TEXT)"
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_wakes_pending_due "
-                    "ON wakes(status, due_at)"
-                )
-                conn.commit()
+                ensure_wake_schema(conn)
+            start_pending_script_wakes(conn, children)
+            reap_script_wakes(conn, children)
             for job in claim_due_wakes(conn):
                 fire_wake_job(conn, job)
-            nxt = next_pending_due_ms(conn)
+            sleep_s = next_wake_sleep_s(conn)
         except Exception as exc:
             print(f"ad wake daemon error: {exc}", file=sys.stderr, flush=True)
             if conn is not None:
@@ -1011,10 +1338,6 @@ def cmd_wake_daemon(_: argparse.Namespace) -> int:
             time.sleep(1.0)
             continue
 
-        if nxt is None:
-            time.sleep(1.0)
-            continue
-        sleep_s = max(0.05, min(1.0, (nxt - now_ms()) / 1000.0))
         time.sleep(sleep_s)
 
 
@@ -1022,15 +1345,7 @@ def cmd_wake(args: argparse.Namespace) -> int:
     tokens = list(args.wake_args)
     as_json = bool(args.json)
     if not tokens:
-        die(
-            "wake usage:\n"
-            "  ad wake <duration> [message...]\n"
-            "  ad wake list\n"
-            "  ad wake cancel <id>\n"
-            "  ad wake clear\n"
-            "  ad wake daemon\n"
-            "  ad wake install|uninstall|status"
-        )
+        die(WAKE_USAGE)
 
     head = tokens[0]
     if head == "list":
@@ -1073,8 +1388,18 @@ def cmd_wake(args: argparse.Namespace) -> int:
             print(f"db={WAKE_DB_PATH}")
         return 0 if running else 1
 
-    # Schedule: ad wake <duration> [message...]
-    return cmd_wake_schedule(head, tokens[1:], as_json=as_json)
+    if try_parse_duration_ms(head) is not None:
+        return cmd_wake_schedule(head, tokens[1:], as_json=as_json)
+    if looks_like_script_arg(head):
+        return cmd_wake_script(head, tokens[1:], as_json=as_json)
+    die(
+        f"invalid wake target {head!r}\n"
+        "  Use a duration (30s, 2m, 1h30m) or a script path that exists.\n"
+        "  Examples:\n"
+        "    ad wake 5m check the build\n"
+        "    ad wake ./wait-for-ci.sh continue"
+    )
+    return 1
 
 
 def cmd_whoami(_: argparse.Namespace) -> int:
@@ -1424,8 +1749,8 @@ def build_parser() -> argparse.ArgumentParser:
         "wake_args",
         nargs="*",
         help=(
-            "<duration> [message...] | list | cancel <id> | clear | "
-            "daemon | install | uninstall | status"
+            "<duration> [message...] | <script> [message...] | list | "
+            "cancel <id> | clear | daemon | install | uninstall | status"
         ),
     )
     p_wake.set_defaults(func=cmd_wake)
@@ -1512,6 +1837,7 @@ def _preprocess_wake_argv(raw: List[str]) -> List[str]:
                 f"FAILED — unknown option {arg!r}\n"
                 "  Wake usage:\n"
                 "    ad wake <duration> [message...]\n"
+                "    ad wake <script> [message...]\n"
                 "    ad wake list\n"
                 "    ad wake cancel <id>"
             )
