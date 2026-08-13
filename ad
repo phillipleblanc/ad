@@ -642,13 +642,24 @@ def wake_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
-def resolve_wake_id(conn: sqlite3.Connection, prefix: str) -> str:
-    rows = list(
-        conn.execute(
-            "SELECT id FROM wakes WHERE id = ? OR id LIKE ?",
-            (prefix, f"{prefix}%"),
+def resolve_wake_id(
+    conn: sqlite3.Connection, prefix: str, *, tab_id: Optional[str] = None
+) -> str:
+    if tab_id is None:
+        rows = list(
+            conn.execute(
+                "SELECT id FROM wakes WHERE id = ? OR id LIKE ?",
+                (prefix, f"{prefix}%"),
+            )
         )
-    )
+    else:
+        rows = list(
+            conn.execute(
+                "SELECT id FROM wakes WHERE target_tab_id = ? "
+                "AND (id = ? OR id LIKE ?)",
+                (tab_id, prefix, f"{prefix}%"),
+            )
+        )
     if not rows:
         die(f"no wake job matching {prefix!r}")
     if len(rows) > 1 and not any(r["id"] == prefix for r in rows):
@@ -1222,13 +1233,16 @@ def cmd_wake_script(script_raw: str, message_parts: Sequence[str], *, as_json: b
 
 
 def cmd_wake_list(as_json: bool) -> int:
+    _label, tab_id, _workspace_id = current_identity()
     with wake_db() as conn:
         rows = [
             wake_row_to_dict(r)
             for r in conn.execute(
-                "SELECT * FROM wakes WHERE status IN ('pending', 'firing', 'running') "
+                "SELECT * FROM wakes WHERE target_tab_id = ? "
+                "AND status IN ('pending', 'firing', 'running') "
                 "ORDER BY CASE COALESCE(kind, 'timer') WHEN 'script' THEN 0 ELSE 1 END, "
-                "due_at ASC"
+                "due_at ASC",
+                (tab_id,),
             )
         ]
     if as_json:
@@ -1253,15 +1267,14 @@ def cmd_wake_list(as_json: bool) -> int:
                 else "due"
             )
             text = job["message"]
-        print(
-            f"{job['id'][:8]}  {eta:12}  {job['target_label']:20}  {text}"
-        )
+        print(f"{job['id'][:8]}  {eta:12}  {text}")
     return 0
 
 
 def cmd_wake_cancel(prefix: str, as_json: bool) -> int:
+    _label, tab_id, _workspace_id = current_identity()
     with wake_db() as conn:
-        job_id = resolve_wake_id(conn, prefix)
+        job_id = resolve_wake_id(conn, prefix, tab_id=tab_id)
         row = conn.execute("SELECT * FROM wakes WHERE id = ?", (job_id,)).fetchone()
         if row is None:
             die(f"no wake job {prefix!r}")
@@ -1283,18 +1296,23 @@ def cmd_wake_cancel(prefix: str, as_json: bool) -> int:
 
 
 def cmd_wake_clear(as_json: bool) -> int:
+    _label, tab_id, _workspace_id = current_identity()
     with wake_db() as conn:
         pids = [
             r["script_pid"]
             for r in conn.execute(
                 "SELECT script_pid FROM wakes "
-                "WHERE status IN ('pending', 'firing', 'running') "
-                "AND script_pid IS NOT NULL"
+                "WHERE target_tab_id = ? "
+                "AND status IN ('pending', 'firing', 'running') "
+                "AND script_pid IS NOT NULL",
+                (tab_id,),
             )
         ]
         cur = conn.execute(
             "UPDATE wakes SET status = 'cancelled' "
-            "WHERE status IN ('pending', 'firing', 'running')"
+            "WHERE target_tab_id = ? "
+            "AND status IN ('pending', 'firing', 'running')",
+            (tab_id,),
         )
         conn.commit()
         n = cur.rowcount

@@ -84,7 +84,7 @@ ad wake install          # install/repair launchd agent
 ad wake uninstall
 ```
 
-Jobs are keyed by `tab_id` / `workspace_id` (not cwd). Stored in SQLite at `$AD_HOME/wake.db`. Scheduling auto-starts the daemon if needed.
+Jobs are keyed by `tab_id` / `workspace_id` (not cwd). Stored in SQLite at `$AD_HOME/wake.db`. Scheduling auto-starts the daemon if needed. `ad wake list`, `cancel`, and `clear` apply only to **your current tab**.
 
 A duration (`30s`, `2m`, `1h30m`) fires at that time. A **script path** fires when that process exits (useful for short monitor scripts). Relative paths resolve from your current working directory. The wake message includes the script exit code and tailed output. `ad wake cancel` / `clear` kill a still-running script.
 

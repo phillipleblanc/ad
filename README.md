@@ -45,7 +45,7 @@ ad skill
 
 Notify (wake idle recipient) is the default for `ad send`. Use `--no-notify` for mailbox-only. Busy agents are skipped unless `--force`.
 
-`ad wake` schedules a durable self-wake for the current herdr tab (SQLite + launchd daemon). Pass a duration (`5m`, `1h30m`) or a script path; a script fires when that process exits. At fire time it writes your mailbox and notifies if idle; if busy, the stop hook picks it up when the turn ends. `make install` / first `ad wake …` installs `tech.leblanc.ad.wake` under LaunchAgents.
+`ad wake` schedules a durable self-wake for the current herdr tab (SQLite + launchd daemon). Pass a duration (`5m`, `1h30m`) or a script path; a script fires when that process exits. `list` / `cancel` / `clear` only affect that tab. At fire time it writes your mailbox and notifies if idle; if busy, the stop hook picks it up when the turn ends. `make install` / first `ad wake …` installs `tech.leblanc.ad.wake` under LaunchAgents.
 
 Claude and Codex Stop hooks should call:
 
