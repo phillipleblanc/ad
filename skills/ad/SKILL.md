@@ -76,6 +76,7 @@ Schedule a durable reminder for **your current tab**. Returns immediately; a lau
 ad wake 5m "check the build"
 ad wake 1h30m
 ad wake ./wait-for-ci.sh "CI finished — continue"
+ad wake pid 12345 "build finished — continue"
 ad wake list
 ad wake cancel <id-prefix>
 ad wake clear
@@ -86,7 +87,9 @@ ad wake uninstall
 
 Jobs are keyed by `tab_id` / `workspace_id` (not cwd). Stored in SQLite at `$AD_HOME/wake.db`. Scheduling auto-starts the daemon if needed. `ad wake list`, `cancel`, and `clear` apply only to **your current tab**.
 
-A duration (`30s`, `2m`, `1h30m`) fires at that time. A **script path** fires when that process exits (useful for short monitor scripts). Relative paths resolve from your current working directory. The wake message includes the script exit code and tailed output. `ad wake cancel` / `clear` kill a still-running script.
+A duration (`30s`, `2m`, `1h30m`) fires at that time. A **script path** fires when that process exits (the daemon starts the script). Relative paths resolve from your current working directory. The wake message includes the script exit code and tailed output. `ad wake cancel` / `clear` kill a still-running **script**.
+
+`ad wake pid <pid>` watches an already-running process and fires when it exits. Prefer this over a throwaway `wait`/`kill -0` script. The wake message includes the exit code when the kernel provides it (macOS kqueue). If the pid is not running at schedule time, `ad` exits with `no such process`. **Cancel/clear only stop watching — they do not kill the watched process.**
 
 ## Receive
 

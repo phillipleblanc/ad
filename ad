@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import select
 import signal
 import sqlite3
 import subprocess
@@ -32,14 +33,16 @@ WAKE_LAUNCHD_LABEL = "tech.leblanc.ad.wake"
 WAKE_DEFAULT_MESSAGE = "continue"
 WAKE_KIND_TIMER = "timer"
 WAKE_KIND_SCRIPT = "script"
+WAKE_KIND_PID = "pid"
 WAKE_SCRIPT_LOG_DIR = DATA_DIR / "wake-scripts"
 WAKE_SUBCOMMANDS = frozenset(
-    {"list", "cancel", "clear", "daemon", "install", "uninstall", "status"}
+    {"list", "cancel", "clear", "daemon", "install", "uninstall", "status", "pid"}
 )
 WAKE_USAGE = (
     "wake usage:\n"
     "  ad wake <duration> [message...]\n"
     "  ad wake <script> [message...]\n"
+    "  ad wake pid <pid> [message...]\n"
     "  ad wake list\n"
     "  ad wake cancel <id>\n"
     "  ad wake clear\n"
@@ -724,6 +727,170 @@ def pid_is_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def process_is_running(pid: Optional[int]) -> bool:
+    """True if pid exists and is not a zombie."""
+    if not pid_is_alive(pid):
+        return False
+    state = process_ps_field(int(pid), "state")
+    if state and state[:1].upper() == "Z":
+        return False
+    return True
+
+
+def parse_watch_pid(raw: str) -> int:
+    text = raw.strip()
+    if not text.isdigit() or int(text) <= 0:
+        die(f"invalid pid {raw!r}")
+    pid = int(text)
+    if not process_is_running(pid):
+        die(f"no such process {pid}")
+    return pid
+
+
+def process_ps_field(pid: int, field: str) -> Optional[str]:
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", f"{field}="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    value = (proc.stdout or "").strip()
+    return value or None
+
+
+def process_start_key(pid: int) -> Optional[str]:
+    return process_ps_field(pid, "lstart")
+
+
+def process_command_line(pid: int) -> str:
+    return process_ps_field(pid, "command") or f"pid {pid}"
+
+
+def decode_wait_status(status: int) -> Optional[int]:
+    try:
+        if os.WIFEXITED(status):
+            return int(os.WEXITSTATUS(status))
+        if os.WIFSIGNALED(status):
+            return 128 + int(os.WTERMSIG(status))
+    except (OverflowError, OSError, ValueError):
+        return None
+    return None
+
+
+# Python's select module often omits these Darwin NOTE_* bits; the values
+# are stable in sys/event.h. Without NOTE_EXITSTATUS, kevent data is 0
+# even when the process was killed.
+KQ_NOTE_EXITSTATUS = int(getattr(select, "KQ_NOTE_EXITSTATUS", 0x04000000))
+KQ_NOTE_EXIT_DETAIL = int(getattr(select, "KQ_NOTE_EXIT_DETAIL", 0x02000000))
+
+
+class PidExitWatcher:
+    """Watch foreign PIDs until they exit.
+
+    On macOS, kqueue EVFILT_PROC/NOTE_EXITSTATUS can supply wait(2) status.
+    Elsewhere (or if kqueue fails) we poll liveness and detect PID reuse.
+    """
+
+    def __init__(self) -> None:
+        self._kq: Any = None
+        if hasattr(select, "kqueue"):
+            try:
+                self._kq = select.kqueue()
+            except OSError:
+                self._kq = None
+        self._job_ids_by_pid: Dict[int, List[str]] = {}
+        self._start_key: Dict[str, Optional[str]] = {}
+        self._pid_by_job: Dict[str, int] = {}
+        self._kq_armed: Dict[str, bool] = {}
+
+    def is_watching(self, job_id: str) -> bool:
+        return job_id in self._pid_by_job
+
+    def watch(self, job_id: str, pid: int, start_key: Optional[str]) -> bool:
+        """Register a watch. Returns False if the process is already gone."""
+        pid = int(pid)
+        self.unwatch(job_id)
+        self._job_ids_by_pid.setdefault(pid, []).append(job_id)
+        self._start_key[job_id] = start_key
+        self._pid_by_job[job_id] = pid
+        self._kq_armed.pop(job_id, None)
+        if self._kq is None:
+            return True
+        flags = select.KQ_NOTE_EXIT | KQ_NOTE_EXITSTATUS | KQ_NOTE_EXIT_DETAIL
+        try:
+            self._kq.control(
+                [
+                    select.kevent(
+                        pid,
+                        select.KQ_FILTER_PROC,
+                        select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                        flags,
+                    )
+                ],
+                0,
+            )
+        except ProcessLookupError:
+            self.unwatch(job_id)
+            return False
+        except (OSError, OverflowError, ValueError):
+            return True
+        self._kq_armed[job_id] = True
+        return True
+
+    def unwatch(self, job_id: str) -> None:
+        pid = self._pid_by_job.pop(job_id, None)
+        self._start_key.pop(job_id, None)
+        self._kq_armed.pop(job_id, None)
+        if pid is None:
+            return
+        remaining = [jid for jid in self._job_ids_by_pid.get(pid, []) if jid != job_id]
+        if remaining:
+            self._job_ids_by_pid[pid] = remaining
+        else:
+            self._job_ids_by_pid.pop(pid, None)
+
+    def poll_exits(self) -> List[Tuple[str, Optional[int]]]:
+        finished: List[Tuple[str, Optional[int]]] = []
+        finished_ids = set()
+        if self._kq is not None:
+            try:
+                events = self._kq.control(None, 64, 0)
+            except OSError:
+                events = []
+            for event in events:
+                pid = int(event.ident)
+                exit_code: Optional[int] = None
+                if int(event.fflags) & KQ_NOTE_EXITSTATUS:
+                    exit_code = decode_wait_status(int(event.data))
+                for job_id in list(self._job_ids_by_pid.get(pid, [])):
+                    finished.append((job_id, exit_code))
+                    finished_ids.add(job_id)
+                    self.unwatch(job_id)
+        for pid, job_ids in list(self._job_ids_by_pid.items()):
+            alive = process_is_running(pid)
+            current_key = process_start_key(pid) if alive else None
+            for job_id in list(job_ids):
+                if job_id in finished_ids:
+                    continue
+                if self._kq_armed.get(job_id):
+                    # kqueue NOTE_EXIT is authoritative; don't race it with kill(0).
+                    continue
+                expected = self._start_key.get(job_id)
+                reused = bool(
+                    alive and expected and current_key and current_key != expected
+                )
+                if (not alive) or reused:
+                    finished.append((job_id, None))
+                    finished_ids.add(job_id)
+                    self.unwatch(job_id)
+        return finished
+
+
 def kill_process_group(pid: Optional[int]) -> None:
     if pid is None or int(pid) <= 0:
         return
@@ -770,6 +937,20 @@ def format_script_completion_message(
     output = read_log_tail(script_log_path(job["id"]))
     if output.strip():
         parts.extend(["output:", output.rstrip()])
+    return "\n".join(parts)
+
+
+def format_pid_completion_message(
+    job: Dict[str, Any], exit_code: Optional[int]
+) -> str:
+    body = str(job.get("message") or "").rstrip()
+    pid = job.get("script_pid")
+    cmd = str(job.get("script_path") or "").strip() or f"pid {pid}"
+    if exit_code is None:
+        status_line = f"[ad wake] pid {pid} ({cmd}) finished (exit code unknown)"
+    else:
+        status_line = f"[ad wake] pid {pid} ({cmd}) exited {exit_code}"
+    parts = [body, "", status_line] if body else [status_line]
     return "\n".join(parts)
 
 
@@ -893,6 +1074,115 @@ def reap_script_wakes(
         fire_wake_job(conn, job)
 
 
+def pid_start_key_reused(pid: Optional[int], expected: Optional[str]) -> bool:
+    if pid is None or int(pid) <= 0:
+        return False
+    if not expected:
+        return False
+    current = process_start_key(int(pid))
+    return bool(current and current != expected)
+
+
+def arm_or_fire_pid_job(
+    conn: sqlite3.Connection,
+    watcher: PidExitWatcher,
+    job: Dict[str, Any],
+) -> None:
+    pid = job.get("script_pid")
+    expected = job.get("script_cwd")
+    gone = (not process_is_running(pid)) or pid_start_key_reused(pid, expected)
+    if gone or not watcher.watch(job["id"], int(pid), expected):
+        cur = conn.execute(
+            "UPDATE wakes SET status = 'firing', script_exit = NULL "
+            "WHERE id = ? AND status = 'running'",
+            (job["id"],),
+        )
+        conn.commit()
+        if cur.rowcount != 1:
+            return
+        job["message"] = format_pid_completion_message(job, None)
+        fire_wake_job(conn, job)
+        return
+    print(
+        f"ad wake: watching pid {job['id'][:8]} pid={pid} {job.get('script_path')}",
+        flush=True,
+    )
+
+
+def start_pending_pid_wakes(
+    conn: sqlite3.Connection,
+    watcher: PidExitWatcher,
+) -> None:
+    rows = list(
+        conn.execute(
+            "SELECT * FROM wakes WHERE COALESCE(kind, 'timer') = ? "
+            "AND status = 'pending'",
+            (WAKE_KIND_PID,),
+        )
+    )
+    for row in rows:
+        cur = conn.execute(
+            "UPDATE wakes SET status = 'running' "
+            "WHERE id = ? AND status = 'pending'",
+            (row["id"],),
+        )
+        conn.commit()
+        if cur.rowcount != 1:
+            continue
+        arm_or_fire_pid_job(conn, watcher, wake_row_to_dict(row))
+
+
+def adopt_running_pid_wakes(
+    conn: sqlite3.Connection,
+    watcher: PidExitWatcher,
+) -> None:
+    rows = list(
+        conn.execute(
+            "SELECT * FROM wakes WHERE COALESCE(kind, 'timer') = ? "
+            "AND status = 'running'",
+            (WAKE_KIND_PID,),
+        )
+    )
+    for row in rows:
+        job = wake_row_to_dict(row)
+        if watcher.is_watching(job["id"]):
+            continue
+        arm_or_fire_pid_job(conn, watcher, job)
+
+
+def reap_pid_wakes(
+    conn: sqlite3.Connection,
+    watcher: PidExitWatcher,
+) -> None:
+    cancelled = list(
+        conn.execute(
+            "SELECT id FROM wakes WHERE COALESCE(kind, 'timer') = ? "
+            "AND status = 'cancelled'",
+            (WAKE_KIND_PID,),
+        )
+    )
+    for row in cancelled:
+        watcher.unwatch(row["id"])
+
+    for job_id, exit_code in watcher.poll_exits():
+        row = conn.execute("SELECT * FROM wakes WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            continue
+        job = wake_row_to_dict(row)
+        if job["status"] != "running":
+            continue
+        cur = conn.execute(
+            "UPDATE wakes SET status = 'firing', script_exit = ? "
+            "WHERE id = ? AND status = 'running'",
+            (exit_code, job_id),
+        )
+        conn.commit()
+        if cur.rowcount != 1:
+            continue
+        job["message"] = format_pid_completion_message(job, exit_code)
+        fire_wake_job(conn, job)
+
+
 def fire_wake_job(conn: sqlite3.Connection, job: Dict[str, Any]) -> None:
     job_id = job["id"]
     try:
@@ -964,13 +1254,13 @@ def next_pending_due_ms(conn: sqlite3.Connection) -> Optional[int]:
 
 
 def next_wake_sleep_s(conn: sqlite3.Connection) -> float:
-    script_active = conn.execute(
-        "SELECT 1 FROM wakes WHERE COALESCE(kind, 'timer') = ? "
+    active = conn.execute(
+        "SELECT 1 FROM wakes WHERE COALESCE(kind, 'timer') IN (?, ?) "
         "AND status IN ('pending', 'running') LIMIT 1",
-        (WAKE_KIND_SCRIPT,),
+        (WAKE_KIND_SCRIPT, WAKE_KIND_PID),
     ).fetchone()
     sleeps = [1.0]
-    if script_active is not None:
+    if active is not None:
         sleeps.append(0.4)
     nxt = next_pending_due_ms(conn)
     if nxt is not None:
@@ -1232,6 +1522,69 @@ def cmd_wake_script(script_raw: str, message_parts: Sequence[str], *, as_json: b
     return 0
 
 
+def cmd_wake_pid(pid_raw: str, message_parts: Sequence[str], *, as_json: bool) -> int:
+    pid = parse_watch_pid(pid_raw)
+    label, tab_id, workspace_id = current_identity()
+    body = " ".join(message_parts).strip() or WAKE_DEFAULT_MESSAGE
+    job_id = str(uuid.uuid4())
+    created = now_ms()
+    cmdline = process_command_line(pid)
+    start_key = process_start_key(pid)
+
+    ensure_wake_daemon()
+    with wake_db() as conn:
+        conn.execute(
+            "INSERT INTO wakes ("
+            "id, target_tab_id, target_workspace_id, target_label, message, "
+            "due_at, status, created_at, fired_at, error, kind, "
+            "script_path, script_pid, script_cwd"
+            ") VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, ?, ?, ?, ?)",
+            (
+                job_id,
+                tab_id,
+                workspace_id,
+                label,
+                body,
+                created,
+                created,
+                WAKE_KIND_PID,
+                cmdline,
+                pid,
+                start_key,
+            ),
+        )
+        conn.commit()
+
+    job = {
+        "id": job_id,
+        "kind": WAKE_KIND_PID,
+        "target_tab_id": tab_id,
+        "target_workspace_id": workspace_id,
+        "target_label": label,
+        "message": body,
+        "due_at": created,
+        "status": "pending",
+        "created_at": created,
+        "script_path": cmdline,
+        "script_pid": pid,
+        "script_cwd": start_key,
+    }
+    if as_json:
+        print(json.dumps({"ok": True, "job": job}, indent=2))
+    else:
+        print(f"wake {job_id[:8]} when pid {pid} exits, for {label}")
+        print(f"process: {cmdline}")
+        print(f"message: {body}")
+    return 0
+
+
+def _short_cmd(cmd: str, limit: int = 48) -> str:
+    text = " ".join(str(cmd).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
 def cmd_wake_list(as_json: bool) -> int:
     _label, tab_id, _workspace_id = current_identity()
     with wake_db() as conn:
@@ -1240,7 +1593,8 @@ def cmd_wake_list(as_json: bool) -> int:
             for r in conn.execute(
                 "SELECT * FROM wakes WHERE target_tab_id = ? "
                 "AND status IN ('pending', 'firing', 'running') "
-                "ORDER BY CASE COALESCE(kind, 'timer') WHEN 'script' THEN 0 ELSE 1 END, "
+                "ORDER BY CASE COALESCE(kind, 'timer') "
+                "WHEN 'script' THEN 0 WHEN 'pid' THEN 0 ELSE 1 END, "
                 "due_at ASC",
                 (tab_id,),
             )
@@ -1259,6 +1613,14 @@ def cmd_wake_list(as_json: bool) -> int:
             detail = job.get("script_path") or ""
             msg = job["message"]
             text = f"{detail} — {msg}" if detail else msg
+        elif kind == WAKE_KIND_PID:
+            eta = "watching" if job["status"] == "running" else "pid"
+            pid = job.get("script_pid")
+            cmd = _short_cmd(job.get("script_path") or "")
+            detail = f"pid {pid}"
+            if cmd:
+                detail = f"pid {pid} ({cmd})"
+            text = f"{detail} — {job['message']}"
         else:
             remaining = job["due_at"] - now
             eta = (
@@ -1280,13 +1642,14 @@ def cmd_wake_cancel(prefix: str, as_json: bool) -> int:
             die(f"no wake job {prefix!r}")
         if row["status"] not in {"pending", "firing", "running"}:
             die(f"wake {job_id[:8]} is {row['status']}, not cancellable")
+        kind = row["kind"] if "kind" in row.keys() else WAKE_KIND_TIMER
         pid = row["script_pid"] if "script_pid" in row.keys() else None
         conn.execute(
             "UPDATE wakes SET status = 'cancelled' WHERE id = ?",
             (job_id,),
         )
         conn.commit()
-    if pid:
+    if pid and kind == WAKE_KIND_SCRIPT:
         kill_process_group(pid)
     if as_json:
         print(json.dumps({"ok": True, "id": job_id, "status": "cancelled"}, indent=2))
@@ -1304,8 +1667,9 @@ def cmd_wake_clear(as_json: bool) -> int:
                 "SELECT script_pid FROM wakes "
                 "WHERE target_tab_id = ? "
                 "AND status IN ('pending', 'firing', 'running') "
+                "AND COALESCE(kind, 'timer') = ? "
                 "AND script_pid IS NOT NULL",
-                (tab_id,),
+                (tab_id, WAKE_KIND_SCRIPT),
             )
         ]
         cur = conn.execute(
@@ -1332,6 +1696,7 @@ def cmd_wake_daemon(_: argparse.Namespace) -> int:
     # Keep one long-lived connection; reopen only after errors.
     conn: Optional[sqlite3.Connection] = None
     children: Dict[str, subprocess.Popen] = {}
+    pid_watcher = PidExitWatcher()
     while True:
         try:
             if conn is None:
@@ -1342,6 +1707,9 @@ def cmd_wake_daemon(_: argparse.Namespace) -> int:
                 ensure_wake_schema(conn)
             start_pending_script_wakes(conn, children)
             reap_script_wakes(conn, children)
+            start_pending_pid_wakes(conn, pid_watcher)
+            adopt_running_pid_wakes(conn, pid_watcher)
+            reap_pid_wakes(conn, pid_watcher)
             for job in claim_due_wakes(conn):
                 fire_wake_job(conn, job)
             sleep_s = next_wake_sleep_s(conn)
@@ -1405,6 +1773,10 @@ def cmd_wake(args: argparse.Namespace) -> int:
             print(f"running={running}")
             print(f"db={WAKE_DB_PATH}")
         return 0 if running else 1
+    if head == "pid":
+        if len(tokens) < 2:
+            die("usage: ad wake pid <pid> [message...]")
+        return cmd_wake_pid(tokens[1], tokens[2:], as_json=as_json)
 
     if try_parse_duration_ms(head) is not None:
         return cmd_wake_schedule(head, tokens[1:], as_json=as_json)
@@ -1412,10 +1784,11 @@ def cmd_wake(args: argparse.Namespace) -> int:
         return cmd_wake_script(head, tokens[1:], as_json=as_json)
     die(
         f"invalid wake target {head!r}\n"
-        "  Use a duration (30s, 2m, 1h30m) or a script path that exists.\n"
+        "  Use a duration (30s, 2m, 1h30m), a script path, or pid <pid>.\n"
         "  Examples:\n"
         "    ad wake 5m check the build\n"
-        "    ad wake ./wait-for-ci.sh continue"
+        "    ad wake ./wait-for-ci.sh continue\n"
+        "    ad wake pid 12345 continue"
     )
     return 1
 
@@ -1767,8 +2140,8 @@ def build_parser() -> argparse.ArgumentParser:
         "wake_args",
         nargs="*",
         help=(
-            "<duration> [message...] | <script> [message...] | list | "
-            "cancel <id> | clear | daemon | install | uninstall | status"
+            "<duration> [message...] | <script> [message...] | pid <pid> [message...] | "
+            "list | cancel <id> | clear | daemon | install | uninstall | status"
         ),
     )
     p_wake.set_defaults(func=cmd_wake)
@@ -1856,6 +2229,7 @@ def _preprocess_wake_argv(raw: List[str]) -> List[str]:
                 "  Wake usage:\n"
                 "    ad wake <duration> [message...]\n"
                 "    ad wake <script> [message...]\n"
+                "    ad wake pid <pid> [message...]\n"
                 "    ad wake list\n"
                 "    ad wake cancel <id>"
             )
